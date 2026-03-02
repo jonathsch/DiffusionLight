@@ -10,10 +10,10 @@ import os
 from PIL import Image
 from tqdm.auto import tqdm
 import json
-
+import imageio
 
 from relighting.inpainter import BallInpainter
-
+from relighting.image_processor import pil_square_image
 from relighting.mask_utils import MaskGenerator
 from relighting.ball_processor import (
     get_ideal_normal_ball,
@@ -32,9 +32,29 @@ from relighting.argument import (
     VAE_MODELS
 )
 
+
+def load_first_frame_from_video(video_path, resolution=(1024, 1024), force_square=True):
+    """Load the first frame from a video file and return as PIL Image (optionally squared/resized)."""
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    try:
+        reader = imageio.get_reader(video_path)
+        frame = reader.get_data(0)
+        reader.close()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read video {video_path}: {e}") from e
+    # imageio returns RGB numpy array (H, W, C)
+    image = Image.fromarray(frame)
+    if force_square:
+        image = pil_square_image(image, resolution)
+    else:
+        image = image.resize(resolution)
+    return image
+
 def create_argparser():    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, required=True ,help='directory that contain the image') #dataset name or directory 
+    parser.add_argument("--dataset", type=str, default=None, help='directory that contain the image (optional when --video is set)')
+    parser.add_argument("--video", type=str, default=None, help='path to a video file; uses the first frame and runs the pipeline to extract environment map') 
     parser.add_argument("--ball_size", type=int, default=256, help="size of the ball in pixel")
     parser.add_argument("--ball_dilate", type=int, default=20, help="How much pixel to dilate the ball to make a sharper edge")
     parser.add_argument("--prompt", type=str, default="a perfect mirrored reflective chrome ball sphere") 
@@ -64,7 +84,10 @@ def create_argparser():
 
     parser.add_argument('--offload', dest='offload', action='store_false', help="to enable diffusers cpu offload")
     parser.set_defaults(offload=False)
-    
+
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"],
+                        help="dtype for the diffusion model (default: bf16). bf16/fp16 for GPU, fp32 for CPU or stability")
+
     parser.add_argument("--limit_input", default=0, type=int, help="limit number of image to process to n image (0 = no limit), useful for run smallset")
 
 
@@ -153,13 +176,17 @@ def main():
     # load arguments
     args = create_argparser().parse_args()
         
-    # get local rank
+    # get local rank and dtype
+    _dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     if args.is_cpu:
         device = torch.device("cpu")
-        torch_dtype = torch.float32
+        torch_dtype = _dtype_map.get(args.dtype, torch.float32)
+        if torch_dtype != torch.float32:
+            torch_dtype = torch.float32  # CPU inference uses fp32
     else:
         device = dist_util.dev()
-        torch_dtype = torch.float16
+        torch_dtype = _dtype_map.get(args.dtype, torch.bfloat16)
+    print(f"Using dtype: {torch_dtype}")
     
     # so, we need ball_dilate >= 16 (2*vae_scale_factor) to make our mask shape = (272, 272)
     assert args.ball_dilate % 2 == 0 # ball dilation should be symmetric
@@ -231,18 +258,33 @@ def main():
     if args.model_option == "sdxl" and args.img_height == 0 and args.img_width == 0:
         args.img_height = 1024
         args.img_width = 1024
-          
-    # load dataset
-    dataset = GeneralLoader(
-        root=args.dataset,
-        resolution=(args.img_width, args.img_height),
-        force_square=args.force_square,
-        return_dict=True,
-        random_shuffle=args.random_loader,
-        process_id=args.idx,
-        process_total=args.total,
-        limit_input=args.limit_input,
-    )
+
+    # load dataset: either from video (first frame) or from directory
+    if args.video is not None:
+        if not args.video.strip():
+            raise ValueError("--video was provided but path is empty")
+        print(f"Loading first frame from video: {args.video}")
+        first_frame = load_first_frame_from_video(
+            args.video,
+            resolution=(args.img_width, args.img_height),
+            force_square=args.force_square,
+        )
+        # single-item "dataset" with same shape as GeneralLoader
+        video_basename = os.path.splitext(os.path.basename(args.video))[0]
+        dataset = [{"image": first_frame, "path": args.video}]
+    else:
+        if args.dataset is None:
+            raise ValueError("Either --dataset or --video must be provided")
+        dataset = GeneralLoader(
+            root=args.dataset,
+            resolution=(args.img_width, args.img_height),
+            force_square=args.force_square,
+            return_dict=True,
+            random_shuffle=args.random_loader,
+            process_id=args.idx,
+            process_total=args.total,
+            limit_input=args.limit_input,
+        )
 
     # interpolate embedding
     embedding_dict = interpolate_embedding(pipe, args)
